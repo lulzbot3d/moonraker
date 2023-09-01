@@ -1,0 +1,19 @@
+# CI for code style and application tests
+
+name: test-code
+on: [push, pull_request]
+jobs:
+  lint-python-code:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v3
+      - uses: weibullguy/python-lint-plus@v1.12.0
+        with:
+          python-root-list: "moonraker scripts"
+          virtual-env: "python-lint-plus"
+          python-version: "3.10"
+          use-pycodestyle: true
+          use-black: false
+          use-mypy: true
+          extra-pycodestyle-options: "--ignore=E226,E301,E302,E303,W503,W504 --max-line-length=88 --max-doc-length=88"
+          extra-mypy-options: "--ignore-missing-imports --follow-imports=silent"
