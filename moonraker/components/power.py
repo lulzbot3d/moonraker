@@ -33,9 +33,8 @@ if TYPE_CHECKING:
     from .machine import Machine
     from .klippy_apis import KlippyAPI as APIComp
     from .mqtt import MQTTClient
-    from .template import JinjaTemplate
     from .http_client import HttpClient
-    from klippy_connection import KlippyConnection
+    from .klippy_connection import KlippyConnection
 
 class PrinterPower:
     def __init__(self, config: ConfigHelper) -> None:
@@ -450,6 +449,8 @@ class HTTPDevice(PowerDevice):
         self.password = config.load_template(
             "password", default_password).render()
         self.protocol = config.get("protocol", default_protocol)
+        if self.port == -1:
+            self.port = 443 if self.protocol.lower() == "https" else 80
 
     async def init_state(self) -> None:
         async with self.request_lock:
@@ -1110,7 +1111,7 @@ class HomeSeer(HTTPDevice):
         query = urlencode(query_args)
         url = (
             f"{self.protocol}://{quote(self.user)}:{quote(self.password)}@"
-            f"{quote(self.addr)}/JSON?{query}"
+            f"{quote(self.addr)}:{self.port}/JSON?{query}"
         )
         return await self._send_http_command(url, request)
 
@@ -1207,7 +1208,7 @@ class MQTTDevice(PowerDevice):
         self.mqtt: MQTTClient = self.server.load_component(config, 'mqtt')
         self.eventloop = self.server.get_event_loop()
         self.cmd_topic: str = config.get('command_topic')
-        self.cmd_payload: JinjaTemplate = config.gettemplate('command_payload')
+        self.cmd_payload = config.gettemplate('command_payload')
         self.retain_cmd_state = config.getboolean('retain_command_state', False)
         self.query_topic: Optional[str] = config.get('query_topic', None)
         self.query_payload = config.gettemplate('query_payload', None)

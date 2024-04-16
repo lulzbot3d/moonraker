@@ -26,7 +26,6 @@ from typing import (
 if TYPE_CHECKING:
     from ...confighelper import ConfigHelper
     from ..shell_command import ShellCommand
-    from ..machine import Machine
     from .update_manager import CommandHelper
     from ..http_client import HttpClient
 
@@ -36,6 +35,7 @@ class GitDeploy(AppDeploy):
         self._configure_path(config)
         self._configure_virtualenv(config)
         self._configure_dependencies(config)
+        self._configure_managed_services(config)
         self.origin: str = config.get('origin')
         self.moved_origin: Optional[str] = config.get('moved_origin', None)
         self.primary_branch = config.get("primary_branch", "master")
@@ -47,27 +47,32 @@ class GitDeploy(AppDeploy):
     async def initialize(self) -> Dict[str, Any]:
         storage = await super().initialize()
         await self.repo.restore_state(storage)
-        self._is_valid = self.repo.is_valid()
+        self._is_valid = storage.get("is_valid", self.repo.is_valid())
         if not self.needs_refresh():
             self.repo.log_repo_info()
         return storage
 
     async def refresh(self) -> None:
-        try:
-            await self._update_repo_state()
-        except Exception:
-            logging.exception("Error Refreshing git state")
+        await self._update_repo_state(raise_exc=False)
 
-    async def _update_repo_state(self, need_fetch: bool = True) -> None:
+    async def _update_repo_state(
+        self, need_fetch: bool = True, raise_exc: bool = True
+    ) -> None:
         self._is_valid = False
-        await self.repo.refresh_repo_state(need_fetch=need_fetch)
-        self.log_info(f"Channel: {self.channel}")
-        self._is_valid = self.repo.is_valid()
-        if not self._is_valid:
-            self.log_info("Repo validation check failed, updates disabled")
+        try:
+            await self.repo.refresh_repo_state(need_fetch=need_fetch)
+        except Exception as e:
+            if raise_exc or isinstance(e, asyncio.CancelledError):
+                raise
         else:
-            self.log_info("Validity check for git repo passed")
-        self._save_state()
+            self._is_valid = self.repo.is_valid()
+        finally:
+            self.log_info(f"Channel: {self.channel}")
+            if not self._is_valid:
+                self.log_info("Repo validation check failed, updates disabled")
+            else:
+                self.log_info("Validity check for git repo passed")
+            self._save_state()
 
     async def update(self) -> bool:
         await self.repo.wait_for_init()
@@ -171,59 +176,6 @@ class GitDeploy(AppDeploy):
         else:
             self.repo.set_rollback_state(rb_state)
 
-    async def _collect_dependency_info(self) -> Dict[str, Any]:
-        pkg_deps = await self._read_system_dependencies()
-        pyreqs = await self._read_python_reqs()
-        npm_hash = await self._get_file_hash(self.npm_pkg_json)
-        logging.debug(
-            f"\nApplication {self.name}: Pre-update dependencies:\n"
-            f"Packages: {pkg_deps}\n"
-            f"Python Requirements: {pyreqs}"
-        )
-        return {
-            "system_packages": pkg_deps,
-            "python_modules": pyreqs,
-            "npm_hash": npm_hash
-        }
-
-    async def _update_dependencies(
-        self, dep_info: Dict[str, Any], force: bool = False
-    ) -> None:
-        packages = await self._read_system_dependencies()
-        modules = await self._read_python_reqs()
-        logging.debug(
-            f"\nApplication {self.name}: Post-update dependencies:\n"
-            f"Packages: {packages}\n"
-            f"Python Requirements: {modules}"
-        )
-        if not force:
-            packages = list(set(packages) - set(dep_info["system_packages"]))
-            modules = list(set(modules) - set(dep_info["python_modules"]))
-        logging.debug(
-            f"\nApplication {self.name}: Dependencies to install:\n"
-            f"Packages: {packages}\n"
-            f"Python Requirements: {modules}\n"
-            f"Force All: {force}"
-        )
-        if packages:
-            await self._install_packages(packages)
-        if modules:
-            await self._update_python_requirements(self.python_reqs or modules)
-        npm_hash: Optional[str] = dep_info["npm_hash"]
-        ret = await self._check_need_update(npm_hash, self.npm_pkg_json)
-        if force or ret:
-            if self.npm_pkg_json is not None:
-                self.notify_status("Updating Node Packages...")
-                try:
-                    await self.cmd_helper.run_cmd(
-                        "npm ci --only=prod", notify=True, timeout=600.,
-                        cwd=str(self.path))
-                except Exception:
-                    self.notify_status("Node Package Update failed")
-
-    async def close(self) -> None:
-        await self.repo.unset_current_instance()
-
 
 GIT_ASYNC_TIMEOUT = 300.
 GIT_ENV_VARS = {
@@ -276,7 +228,6 @@ class GitRepo:
 
         self.repo_warnings: List[str] = []
         self.repo_anomalies: List[str] = []
-        self.managing_instances: List[str] = []
         self.init_evt: Optional[asyncio.Event] = None
         self.initialized: bool = False
         self.git_operation_lock = asyncio.Lock()
@@ -319,8 +270,6 @@ class GitRepo:
         self.rollback_version = GitVersion(str(rbv))
         if not await self._detect_git_dir():
             self.valid_git_repo = False
-        if self.valid_git_repo:
-            await self.set_current_instance()
         self._check_warnings()
 
     def get_persistent_data(self) -> Dict[str, Any]:
@@ -420,6 +369,7 @@ class GitRepo:
             self._check_warnings()
         except Exception:
             logging.exception(f"Git Repo {self.alias}: Initialization failure")
+            self._check_warnings()
             raise
         else:
             self.initialized = True
@@ -442,17 +392,17 @@ class GitRepo:
                     " is not a valid git repo")
                 return False
             await self._wait_for_lock_release()
-            retries = 3
-            while retries:
+            attempts = 3
+            while attempts:
                 self.git_messages.clear()
                 try:
                     cmd = "status --porcelain -b"
-                    resp: Optional[str] = await self._run_git_cmd(cmd, retries=1)
+                    resp: Optional[str] = await self._run_git_cmd(cmd, attempts=1)
                 except Exception:
-                    retries -= 1
+                    attempts -= 1
                     resp = None
                     # Attempt to recover from "loose object" error
-                    if retries and self.repo_corrupt:
+                    if attempts and self.repo_corrupt:
                         if not await self._repair_loose_objects():
                             # Since we are unable to recover, immediately
                             # return
@@ -477,7 +427,6 @@ class GitRepo:
                     if ext in SRC_EXTS:
                         self.untracked_files.append(fname)
             self.valid_git_repo = True
-        await self.set_current_instance()
         return True
 
     async def _detect_git_dir(self) -> bool:
@@ -669,8 +618,8 @@ class GitRepo:
         async with self.git_operation_lock:
             for _ in range(3):
                 try:
-                    await self._run_git_cmd(cmd, retries=1, corrupt_msg="error: ")
-                except self.cmd_helper.scmd_error as err:
+                    await self._run_git_cmd(cmd, attempts=1, corrupt_msg="error: ")
+                except self.cmd_helper.get_shell_command().error as err:
                     if err.return_code == 1:
                         return False
                     if self.repo_corrupt:
@@ -720,6 +669,12 @@ class GitRepo:
         self.repo_anomalies.clear()
         if self.repo_corrupt:
             self.repo_warnings.append("Repo is corrupt")
+        if self.git_branch == "?":
+            self.repo_warnings.append("Failed to detect git branch")
+        elif self.git_remote == "?":
+            self.repo_warnings.append(
+                f"Failed to detect tracking remote for branch {self.git_branch}"
+            )
         if self.upstream_url == "?":
             self.repo_warnings.append("Failed to detect repo url")
             return
@@ -749,12 +704,6 @@ class GitRepo:
             self.repo_warnings.append(
                 "Repo is dirty.  Detected the following modifed files: "
                 f"{self.modified_files}"
-            )
-        if len(self.managing_instances) > 1:
-            instances = "\n".join([f"  {ins}" for ins in self.managing_instances])
-            self.repo_anomalies.append(
-                f"Multiple instances of Moonraker managing this repo:\n"
-                f"{instances}"
             )
         self._generate_warn_msg()
 
@@ -788,7 +737,7 @@ class GitRepo:
                     if self.git_remote == "?" or self.git_branch == "?":
                         raise self.server.error("Cannot reset, unknown remote/branch")
                     ref = f"{self.git_remote}/{self.git_branch}"
-            await self._run_git_cmd(f"reset --hard {ref}", retries=2)
+            await self._run_git_cmd(f"reset --hard {ref}", attempts=2)
             self.repo_corrupt = False
 
     async def fetch(self) -> None:
@@ -800,7 +749,7 @@ class GitRepo:
     async def clean(self) -> None:
         self._verify_repo()
         async with self.git_operation_lock:
-            await self._run_git_cmd("clean -d -f", retries=2)
+            await self._run_git_cmd("clean -d -f", attempts=2)
 
     async def pull(self) -> None:
         self._verify_repo()
@@ -859,7 +808,7 @@ class GitRepo:
         args = f"{cmd} {key} '{pattern}'" if pattern else f"{cmd} {key}"
         try:
             return await self.config_cmd(args)
-        except self.cmd_helper.scmd_error as e:
+        except self.cmd_helper.get_shell_command().error as e:
             if e.return_code == 1:
                 return None
             raise
@@ -884,9 +833,9 @@ class GitRepo:
             for attempt in range(3):
                 try:
                     return await self._run_git_cmd(
-                        f"config {args}", retries=1, log_complete=verbose
+                        f"config {args}", attempts=1, log_complete=verbose
                     )
-                except self.cmd_helper.scmd_error as e:
+                except self.cmd_helper.get_shell_command().error as e:
                     if 1 <= (e.return_code or 10) <= 6 or attempt == 2:
                         raise
             raise self.server.error("Failed to run git-config")
@@ -907,7 +856,7 @@ class GitRepo:
 
     async def run_fsck(self) -> None:
         async with self.git_operation_lock:
-            await self._run_git_cmd("fsck --full", timeout=300., retries=1)
+            await self._run_git_cmd("fsck --full", timeout=300., attempts=1)
 
     async def clone(self) -> None:
         if self.is_submodule_or_worktree():
@@ -926,7 +875,10 @@ class GitRepo:
             if self.backup_path.exists():
                 await event_loop.run_in_thread(shutil.rmtree, self.backup_path)
             await self._check_lock_file_exists(remove=True)
-            cmd = f"clone --filter=blob:none {self.recovery_url} {self.backup_path}"
+            cmd = (
+                f"clone --branch {self.primary_branch} --filter=blob:none "
+                f"{self.recovery_url} {self.backup_path}"
+            )
             try:
                 await self._run_git_cmd_async(cmd, 1, False, False)
             except Exception as e:
@@ -1023,50 +975,6 @@ class GitRepo:
                 tagged_commits[sha] = tag
             # Return tagged commits as SHA keys mapped to tag values
             return tagged_commits
-
-    async def set_current_instance(self) -> None:
-        # Check to see if multiple instances of Moonraker are configured
-        # to manage this repo
-        full_id = self._get_instance_id()
-        self.managing_instances.clear()
-        try:
-            instances = await self.config_get(
-                "moonraker.instance", get_all=True, local_only=True
-            )
-            if instances is None:
-                await self.config_set("moonraker.instance", full_id)
-                self.managing_instances = [full_id]
-            else:
-                det_instances = [
-                    ins.strip() for ins in instances.split("\n") if ins.strip()
-                ]
-                if full_id not in det_instances:
-                    await self.config_add("moonraker.instance", full_id)
-                    det_instances.append(full_id)
-                self.managing_instances = det_instances
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logging.info(
-                f"Git Repo {self.alias}: Moonraker Instance Validation Error, {e}"
-            )
-
-    async def unset_current_instance(self) -> None:
-        full_id = self._get_instance_id()
-        if full_id not in self.managing_instances:
-            return
-        try:
-            await self.config_unset("moonraker.instance", pattern=full_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logging.info(f"Git repo {self.alias}: Error removing instance, {e}")
-
-    def _get_instance_id(self) -> str:
-        machine: Machine = self.server.lookup_component("machine")
-        cur_name = machine.unit_name
-        cur_uuid: str = self.server.get_app_args()["instance_uuid"]
-        return f"{cur_name}@{cur_uuid}"
 
     def get_repo_status(self) -> Dict[str, Any]:
         no_untrk_src = len(self.untracked_files) == 0
@@ -1194,12 +1102,13 @@ class GitRepo:
                 "Attempting to repair loose objects..."
             )
         try:
-            await self.cmd_helper.run_cmd_with_response(
+            shell_cmd = self.cmd_helper.get_shell_command()
+            await shell_cmd.exec_cmd(
                 "find .git/objects/ -type f -empty | xargs rm",
-                timeout=10., retries=1, cwd=str(self.src_path))
+                timeout=10., attempts=1, cwd=str(self.src_path))
             await self._run_git_cmd_async(
-                "fetch --all -p", retries=1, fix_loose=False)
-            await self._run_git_cmd("fsck --full", timeout=300., retries=1)
+                "fetch --all -p", attempts=1, fix_loose=False)
+            await self._run_git_cmd("fsck --full", timeout=300., attempts=1)
         except Exception:
             msg = (
                 "Attempt to repair loose objects failed, "
@@ -1216,7 +1125,7 @@ class GitRepo:
 
     async def _run_git_cmd_async(self,
                                  cmd: str,
-                                 retries: int = 5,
+                                 attempts: int = 5,
                                  need_git_path: bool = True,
                                  fix_loose: bool = True
                                  ) -> None:
@@ -1231,10 +1140,11 @@ class GitRepo:
             git_cmd = f"git -C {self.src_path} {cmd}"
         else:
             git_cmd = f"git {cmd}"
-        scmd = self.cmd_helper.build_shell_command(
+        shell_cmd = self.cmd_helper.get_shell_command()
+        scmd = shell_cmd.build_shell_command(
             git_cmd, callback=self._handle_process_output,
             env=env)
-        while retries:
+        while attempts:
             self.git_messages.clear()
             self.fetch_input_recd = False
             self.fetch_timeout_handle = event_loop.delay_callback(
@@ -1254,14 +1164,14 @@ class GitRepo:
                     # Only attempt to repair loose objects once. Re-run
                     # the command once.
                     fix_loose = False
-                    retries = 2
+                    attempts = 2
                 else:
-                    # since the attept to repair failed, bypass retries
+                    # since the attept to repair failed, bypass attempts
                     # and immediately raise an exception
                     raise self.server.error(
                         "Unable to repair loose objects, use hard recovery"
                     )
-            retries -= 1
+            attempts -= 1
             await asyncio.sleep(.5)
             await self._check_lock_file_exists(remove=True)
         raise self.server.error(f"Git Command '{cmd}' failed")
@@ -1303,21 +1213,22 @@ class GitRepo:
         self,
         git_args: str,
         timeout: float = 20.,
-        retries: int = 5,
+        attempts: int = 5,
         env: Optional[Dict[str, str]] = None,
         corrupt_msg: str = "fatal: ",
         log_complete: bool = True
     ) -> str:
+        shell_cmd = self.cmd_helper.get_shell_command()
         try:
-            return await self.cmd_helper.run_cmd_with_response(
+            return await shell_cmd.exec_cmd(
                 f"git -C {self.src_path} {git_args}",
                 timeout=timeout,
-                retries=retries,
+                attempts=attempts,
                 env=env,
                 sig_idx=2,
                 log_complete=log_complete
             )
-        except self.cmd_helper.scmd_error as e:
+        except shell_cmd.error as e:
             stdout = e.stdout.decode().strip()
             stderr = e.stderr.decode().strip()
             msg_lines: List[str] = []

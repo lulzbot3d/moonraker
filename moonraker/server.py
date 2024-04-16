@@ -21,12 +21,16 @@ import uuid
 import traceback
 from . import confighelper
 from .eventloop import EventLoop
-from .app import MoonrakerApp
-from .klippy_connection import KlippyConnection
-from .utils import ServerError, Sentinel, get_software_info, json_wrapper
+from .utils import (
+    ServerError,
+    Sentinel,
+    get_software_info,
+    json_wrapper,
+    pip_utils,
+    source_info
+)
 from .loghelper import LogManager
 from .common import RequestType
-from .websockets import WebsocketManager
 
 # Annotation imports
 from typing import (
@@ -43,6 +47,9 @@ from typing import (
 )
 if TYPE_CHECKING:
     from .common import WebRequest
+    from .components.application import MoonrakerApp
+    from .components.websockets import WebsocketManager
+    from .components.klippy_connection import KlippyConnection
     from .components.file_manager.file_manager import FileManager
     from .components.machine import Machine
     from .components.extensions import ExtensionManager
@@ -50,11 +57,12 @@ if TYPE_CHECKING:
     _T = TypeVar("_T", Sentinel, Any)
 
 API_VERSION = (1, 4, 0)
+SERVER_COMPONENTS = ['application', 'websockets', 'klippy_connection']
 CORE_COMPONENTS = [
-    'dbus_manager', 'database', 'file_manager', 'klippy_apis',
-    'machine', 'data_store', 'shell_command', 'proc_stats',
-    'job_state', 'job_queue', 'http_client', 'announcements',
-    'webcam', 'extensions',
+    'dbus_manager', 'database', 'file_manager', 'authorization',
+    'klippy_apis', 'machine', 'data_store', 'shell_command',
+    'proc_stats', 'job_state', 'job_queue', 'http_client',
+    'announcements', 'webcam', 'extensions'
 ]
 
 
@@ -81,6 +89,7 @@ class Server:
         self.ssl_port: int = config.getint('ssl_port', 7130)
         self.exit_reason: str = ""
         self.server_running: bool = False
+        self.pip_recovery_attempted: bool = False
 
         # Configure Debug Logging
         config.getboolean('enable_debug_logging', False, deprecate=True)
@@ -88,16 +97,19 @@ class Server:
         log_level = logging.DEBUG if args["verbose"] else logging.INFO
         logging.getLogger().setLevel(log_level)
         self.event_loop.set_debug(args["asyncio_debug"])
-        self.klippy_connection = KlippyConnection(self)
+        self.klippy_connection: KlippyConnection
+        self.klippy_connection = self.load_component(config, "klippy_connection")
 
         # Tornado Application/Server
-        self.moonraker_app = app = MoonrakerApp(config)
+        self.moonraker_app: MoonrakerApp = self.load_component(config, "application")
+        app = self.moonraker_app
         self.register_endpoint = app.register_endpoint
         self.register_debug_endpoint = app.register_debug_endpoint
         self.register_static_file_handler = app.register_static_file_handler
         self.register_upload_handler = app.register_upload_handler
         self.log_manager.set_server(self)
-        self.websocket_manager = WebsocketManager(config)
+        self.websocket_manager: WebsocketManager
+        self.websocket_manager = self.load_component(config, "websockets")
 
         for warning in args.get("startup_warnings", []):
             self.add_warning(warning)
@@ -119,6 +131,12 @@ class Server:
 
     def get_app_args(self) -> Dict[str, Any]:
         return dict(self.app_args)
+
+    def get_app_arg(self, key: str, default=Sentinel.MISSING) -> Any:
+        val = self.app_args.get(key, default)
+        if val is Sentinel.MISSING:
+            raise KeyError(f"No key '{key}' in Application Arguments")
+        return val
 
     def get_event_loop(self) -> EventLoop:
         return self.event_loop
@@ -248,7 +266,6 @@ class Server:
         for section in cfg_sections:
             self.load_component(config, section, None)
 
-        self.klippy_connection.configure(config)
         config.validate_config()
         self._is_configured = True
 
@@ -271,12 +288,18 @@ class Server:
         try:
             full_name = f"moonraker.components.{component_name}"
             module = importlib.import_module(full_name)
-            is_core = component_name in CORE_COMPONENTS
-            fallback: Optional[str] = "server" if is_core else None
-            config = config.getsection(component_name, fallback)
+            # Server components use the [server] section for configuration
+            if component_name not in SERVER_COMPONENTS:
+                is_core = component_name in CORE_COMPONENTS
+                fallback: Optional[str] = "server" if is_core else None
+                config = config.getsection(component_name, fallback)
             load_func = getattr(module, "load_component")
             component = load_func(config)
-        except Exception:
+        except Exception as e:
+            ucomps: List[str] = self.app_args.get("unofficial_components", [])
+            if isinstance(e, ModuleNotFoundError) and component_name not in ucomps:
+                if self.try_pip_recovery(e.name or "unknown"):
+                    return self.load_component(config, component_name, default)
             msg = f"Unable to load component: ({component_name})"
             logging.exception(msg)
             if component_name not in self.failed_components:
@@ -287,6 +310,36 @@ class Server:
         self.components[component_name] = component
         logging.info(f"Component ({component_name}) loaded")
         return component
+
+    def try_pip_recovery(self, missing_module: str) -> bool:
+        if self.pip_recovery_attempted:
+            return False
+        self.pip_recovery_attempted = True
+        src_dir = source_info.source_path()
+        req_file = src_dir.joinpath("scripts/moonraker-requirements.txt")
+        if not req_file.is_file():
+            return False
+        pip_cmd = f"{sys.executable} -m pip"
+        pip_exec = pip_utils.PipExecutor(pip_cmd, logging.info)
+        logging.info(f"Module '{missing_module}' not found. Attempting Pip Update...")
+        logging.info("Checking Pip Version...")
+        try:
+            pipver = pip_exec.get_pip_version()
+            if pip_utils.check_pip_needs_update(pipver):
+                cur_ver = pipver.pip_version_string
+                new_ver = ".".join([str(part) for part in pip_utils.MIN_PIP_VERSION])
+                logging.info(f"Updating Pip from {cur_ver} to {new_ver}...")
+                pip_exec.update_pip()
+        except Exception:
+            logging.exception("Pip version check failed")
+            return False
+        logging.info("Installing Moonraker python dependencies...")
+        try:
+            pip_exec.install_packages(req_file, {"SKIP_CYTHON": "Y"})
+        except Exception:
+            logging.exception("Failed to install python packages")
+            return False
+        return True
 
     def lookup_component(
         self, component_name: str, default: _T = Sentinel.MISSING
@@ -561,6 +614,9 @@ def main(from_package: bool = True) -> None:
         if not comms_dir.exists():
             comms_dir.mkdir()
         unix_sock = str(comms_dir.joinpath("moonraker.sock"))
+    misc_dir = data_path.joinpath("misc")
+    if not misc_dir.exists():
+        misc_dir.mkdir()
     app_args = {
         "data_path": str(data_path),
         "is_default_data_path": cmd_line_args.datapath is None,

@@ -12,9 +12,9 @@ import logging
 import getpass
 import asyncio
 import pathlib
-from .utils import ServerError, get_unix_peer_credentials
-from .utils import json_wrapper as jsonw
-from .common import KlippyState, RequestType
+from ..utils import ServerError, get_unix_peer_credentials
+from ..utils import json_wrapper as jsonw
+from ..common import KlippyState, RequestType
 
 # Annotation imports
 from typing import (
@@ -31,14 +31,13 @@ from typing import (
     Union
 )
 if TYPE_CHECKING:
-    from .server import Server
-    from .common import WebRequest, APITransport, BaseRemoteConnection
-    from .confighelper import ConfigHelper
-    from .components.klippy_apis import KlippyAPI
-    from .components.file_manager.file_manager import FileManager
-    from .components.machine import Machine
-    from .components.job_state import JobState
-    from .components.database import MoonrakerDatabase as Database
+    from ..common import WebRequest, APITransport, BaseRemoteConnection
+    from ..confighelper import ConfigHelper
+    from .klippy_apis import KlippyAPI
+    from .file_manager.file_manager import FileManager
+    from .machine import Machine
+    from .job_state import JobState
+    from .database import MoonrakerDatabase as Database
     FlexCallback = Callable[..., Optional[Coroutine]]
     Subscription = Dict[str, Optional[List[str]]]
 
@@ -50,6 +49,12 @@ RESERVED_ENDPOINTS = [
     "register_remote_method",
 ]
 
+# Items to exclude from the subscription cache.  They never change and can be
+# quite large.
+CACHE_EXCLUSIONS = {
+    "configfile": ["config", "settings"]
+}
+
 INIT_TIME = .25
 LOG_ATTEMPT_INTERVAL = int(2. / INIT_TIME + .5)
 MAX_LOG_ATTEMPTS = 10 * LOG_ATTEMPT_INTERVAL
@@ -57,9 +62,11 @@ UNIX_BUFFER_LIMIT = 20 * 1024 * 1024
 SVC_INFO_KEY = "klippy_connection.service_info"
 
 class KlippyConnection:
-    def __init__(self, server: Server) -> None:
-        self.server = server
-        self.uds_address = pathlib.Path("/tmp/klippy_uds")
+    def __init__(self, config: ConfigHelper) -> None:
+        self.server = config.get_server()
+        self.uds_address = config.getpath(
+            "klippy_uds_address", pathlib.Path("/tmp/klippy_uds")
+        )
         self.writer: Optional[asyncio.StreamWriter] = None
         self.connection_mutex: asyncio.Lock = asyncio.Lock()
         self.event_loop = self.server.get_event_loop()
@@ -94,12 +101,6 @@ class KlippyConnection:
         self.register_remote_method(
             'process_status_update', self._process_status_update,
             need_klippy_reg=False)
-        self.server.register_component("klippy_connection", self)
-
-    def configure(self, config: ConfigHelper):
-        self.uds_address = config.getpath(
-            "klippy_uds_address", self.uds_address
-        )
 
     @property
     def klippy_apis(self) -> KlippyAPI:
@@ -294,16 +295,7 @@ class KlippyConnection:
                 logging.info("Klippy Connection Established")
                 self.writer = writer
                 if self._get_peer_credentials(writer):
-                    machine: Machine = self.server.lookup_component("machine")
-                    provider = machine.get_system_provider()
-                    svc_info = await provider.extract_service_info(
-                        "klipper", self._peer_cred["process_id"]
-                    )
-                    if svc_info != self._service_info:
-                        db: Database = self.server.lookup_component('database')
-                        db.insert_item("moonraker", SVC_INFO_KEY, svc_info)
-                        self._service_info = svc_info
-                        machine.log_service_info(svc_info)
+                    await self._get_service_info(self._peer_cred["process_id"])
             self.event_loop.create_task(self._read_stream(reader))
             return await self._init_klippy_connection()
 
@@ -316,13 +308,27 @@ class KlippyConnection:
             str(self.uds_address), limit=UNIX_BUFFER_LIMIT)
 
     def _get_peer_credentials(self, writer: asyncio.StreamWriter) -> bool:
-        self._peer_cred = get_unix_peer_credentials(writer, "Klippy")
-        if not self._peer_cred:
+        peer_cred = get_unix_peer_credentials(writer, "Klippy")
+        if not peer_cred:
             return False
+        if peer_cred.get("process_id") == 1:
+            logging.debug("Klipper Unix Socket created via Systemd Socket Activation")
+            return False
+        self._peer_cred = peer_cred
         logging.debug(
             f"Klippy Connection: Received Peer Credentials: {self._peer_cred}"
         )
         return True
+
+    async def _get_service_info(self, process_id: int) -> None:
+        machine: Machine = self.server.lookup_component("machine")
+        provider = machine.get_system_provider()
+        svc_info = await provider.extract_service_info("klipper", process_id)
+        if svc_info != self._service_info:
+            db: Database = self.server.lookup_component('database')
+            db.insert_item("moonraker", SVC_INFO_KEY, svc_info)
+            self._service_info = svc_info
+            machine.log_service_info(svc_info)
 
     async def _init_klippy_connection(self) -> bool:
         self._klippy_identified = False
@@ -392,6 +398,16 @@ class KlippyConnection:
             self._klipper_version = version
             msg = f"Klipper Version: {version}"
             self.server.add_log_rollover_item("klipper_version", msg)
+        klipper_pid: Optional[int] = result.get("process_id")
+        if klipper_pid is not None:
+            cur_pid: Optional[int] = self._peer_cred.get("process_id")
+            if cur_pid is None or klipper_pid != cur_pid:
+                self._peer_cred = dict(
+                    process_id=klipper_pid,
+                    group_id=result.get("group_id", -1),
+                    user_id=result.get("user_id", -1)
+                )
+                await self._get_service_info(klipper_pid)
         self._klippy_info = dict(result)
         state_message: str = self._state.message
         if "state_message" in self._klippy_info:
@@ -576,16 +592,6 @@ class KlippyConnection:
                     "No connection associated with subscription request"
                 )
             requested_sub: Subscription = args.get('objects', {})
-            if self.server.is_verbose_enabled() and "configfile" in requested_sub:
-                cfg_sub = requested_sub["configfile"]
-                if (
-                    cfg_sub is None or "config" in cfg_sub or "settings" in cfg_sub
-                ):
-                    logging.debug(
-                        f"Detected 'configfile: {cfg_sub}' subscription.  The "
-                        "'config' and 'status' fields in this object do not change "
-                        "and substantially increase cache size."
-                    )
             all_subs: Subscription = dict(requested_sub)
             # Build the subscription request from a superset of all client subscriptions
             for sub in self.subscriptions.values():
@@ -617,7 +623,23 @@ class KlippyConnection:
                             continue
                         if value != cached_status[field_name]:
                             status_diff.setdefault(obj, {})[field_name] = value
-                self.subscription_cache[obj] = fields
+                if obj in CACHE_EXCLUSIONS:
+                    # Make a shallow copy so we can pop off fields we want to
+                    # exclude from the cache without modifying the return value
+                    fields_to_cache = dict(fields)
+                    removed: List[str] = []
+                    for excluded_field in CACHE_EXCLUSIONS[obj]:
+                        if excluded_field in fields_to_cache:
+                            removed.append(excluded_field)
+                            del fields_to_cache[excluded_field]
+                    if removed:
+                        logging.debug(
+                            "Removed excluded fields from subscription cache: "
+                            f"{obj}: {removed}"
+                        )
+                    self.subscription_cache[obj] = fields_to_cache
+                else:
+                    self.subscription_cache[obj] = fields
                 # Prune Response
                 if obj in requested_sub:
                     valid_fields = requested_sub[obj]
@@ -789,3 +811,6 @@ class KlippyRequest:
             'method': self.rpc_method,
             'params': self.params
         }
+
+def load_component(config: ConfigHelper) -> KlippyConnection:
+    return KlippyConnection(config)

@@ -16,7 +16,6 @@ from .app_deploy import AppDeploy
 from .git_deploy import GitDeploy
 from .zip_deploy import ZipDeploy
 from .system_deploy import PackageDeploy
-from .web_deploy import WebClientDeploy
 from ...common import RequestType
 
 # Annotation imports
@@ -37,7 +36,7 @@ if TYPE_CHECKING:
     from ...server import Server
     from ...confighelper import ConfigHelper
     from ...common import WebRequest
-    from ...klippy_connection import KlippyConnection
+    from ..klippy_connection import KlippyConnection
     from ..shell_command import ShellCommandFactory as SCMDComp
     from ..database import MoonrakerDatabase as DBComp
     from ..database import NamespaceWrapper
@@ -49,15 +48,13 @@ if TYPE_CHECKING:
 
 # Check To see if Updates are necessary each hour
 UPDATE_REFRESH_INTERVAL = 3600.
-# Perform auto refresh no later than 4am
-MAX_UPDATE_HOUR = 4
 
 def get_deploy_class(
     app_type: Union[AppType, str], default: _T
 ) -> Union[Type[BaseDeploy], _T]:
     key = AppType.from_string(app_type) if isinstance(app_type, str) else app_type
     _deployers = {
-        AppType.WEB: WebClientDeploy,
+        AppType.WEB: ZipDeploy,
         AppType.GIT_REPO: GitDeploy,
         AppType.ZIP: ZipDeploy
     }
@@ -67,10 +64,24 @@ class UpdateManager:
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.event_loop = self.server.get_event_loop()
+        self.instance_tracker = InstanceTracker(self.server)
         self.kconn: KlippyConnection
         self.kconn = self.server.lookup_component("klippy_connection")
         self.app_config = get_base_configuration(config)
+
         auto_refresh_enabled = config.getboolean('enable_auto_refresh', False)
+        self.refresh_window = config.getintlist('refresh_window', [0, 5],
+                                                separator='-', count=2)
+        if (
+            not (0 <= self.refresh_window[0] <= 23) or
+            not (0 <= self.refresh_window[1] <= 23)
+        ):
+            raise config.error("The hours specified in 'refresh_window'"
+                               " must be between 0 and 23.")
+        if self.refresh_window[0] == self.refresh_window[1]:
+            raise config.error("The start and end hours specified"
+                               " in 'refresh_window' cannot be the same.")
+
         self.cmd_helper = CommandHelper(config, self.get_updaters)
         self.updaters: Dict[str, BaseDeploy] = {}
         if config.getboolean('enable_system_updates', True):
@@ -168,6 +179,7 @@ class UpdateManager:
         return self.updaters
 
     async def component_init(self) -> None:
+        self.instance_tracker.set_instance_id()
         # Prune stale data from the database
         umdb = self.cmd_helper.get_umdb()
         db_keys = await umdb.keys()
@@ -210,28 +222,35 @@ class UpdateManager:
         kcfg.set_option("path", kpath)
         kcfg.set_option("env", executable)
         kcfg.set_option("type", str(app_type))
-        need_notification = not isinstance(kupdater, AppDeploy)
+        notify = not isinstance(kupdater, AppDeploy)
         kclass = get_deploy_class(app_type, BaseDeploy)
-        self.updaters['klipper'] = kclass(kcfg, self.cmd_helper)
-        coro = self._update_klipper_repo(need_notification)
+        coro = self._update_klipper_repo(kclass(kcfg, self.cmd_helper), notify)
         self.event_loop.create_task(coro)
 
-    async def _update_klipper_repo(self, notify: bool) -> None:
+    async def _update_klipper_repo(self, updater: BaseDeploy, notify: bool) -> None:
         async with self.cmd_request_lock:
+            self.updaters['klipper'] = updater
             umdb = self.cmd_helper.get_umdb()
             await umdb.pop('klipper', None)
-            await self.updaters['klipper'].initialize()
-            await self.updaters['klipper'].refresh()
+            await updater.initialize()
+            await updater.refresh()
         if notify:
             self.cmd_helper.notify_update_refreshed()
 
-    async def _handle_auto_refresh(self, eventtime: float) -> float:
+    def _is_within_refresh_window(self) -> bool:
         cur_hour = time.localtime(time.time()).tm_hour
+        if self.refresh_window[0] < self.refresh_window[1]:
+            return self.refresh_window[0] <= cur_hour < self.refresh_window[1]
+        return cur_hour >= self.refresh_window[0] or cur_hour < self.refresh_window[1]
+
+    async def _handle_auto_refresh(self, eventtime: float) -> float:
         log_remaining_time = True
         if self.initial_refresh_complete:
             log_remaining_time = False
-            # Update when the local time is between 12AM and 5AM
-            if cur_hour >= MAX_UPDATE_HOUR:
+            # Update only if within the refresh window
+            if not self._is_within_refresh_window():
+                logging.debug("update_manager: current time is outside of"
+                              " the refresh window, auto refresh rescheduled")
                 return eventtime + UPDATE_REFRESH_INTERVAL
             if self.kconn.is_printing():
                 # Don't Refresh during a print
@@ -478,6 +497,7 @@ class UpdateManager:
     async def close(self) -> None:
         if self.refresh_timer is not None:
             self.refresh_timer.stop()
+        self.instance_tracker.close()
         for updater in self.updaters.values():
             ret = updater.close()
             if ret is not None:
@@ -496,10 +516,6 @@ class CommandHelper:
         config.getboolean('enable_repo_debug', False, deprecate=True)
         if self.server.is_debug_enabled():
             logging.warning("UPDATE MANAGER: REPO DEBUG ENABLED")
-        shell_cmd: SCMDComp = self.server.lookup_component('shell_command')
-        self.scmd_error = shell_cmd.error
-        self.build_shell_command = shell_cmd.build_shell_command
-        self.run_cmd_with_response = shell_cmd.exec_cmd
         self.pkg_updater: Optional[PackageDeploy] = None
 
         # database management
@@ -526,6 +542,9 @@ class CommandHelper:
 
     def get_server(self) -> Server:
         return self.server
+
+    def get_shell_command(self) -> SCMDComp:
+        return self.server.lookup_component("shell_command")
 
     def get_http_client(self) -> HttpClient:
         return self.http_client
@@ -579,7 +598,7 @@ class CommandHelper:
         cmd: str,
         timeout: float = 20.,
         notify: bool = False,
-        retries: int = 1,
+        attempts: int = 1,
         env: Optional[Dict[str, str]] = None,
         cwd: Optional[str] = None,
         sig_idx: int = 1,
@@ -587,14 +606,10 @@ class CommandHelper:
     ) -> None:
         cb = self.notify_update_response if notify else None
         log_stderr |= self.server.is_verbose_enabled()
-        scmd = self.build_shell_command(
-            cmd, callback=cb, env=env, cwd=cwd, log_stderr=log_stderr
+        await self.get_shell_command().run_cmd_async(
+            cmd, cb, timeout=timeout, attempts=attempts,
+            env=env, cwd=cwd, sig_idx=sig_idx, log_stderr=log_stderr
         )
-        for _ in range(retries):
-            if await scmd.run(timeout=timeout, sig_idx=sig_idx):
-                break
-        else:
-            raise self.server.error("Shell Command Error")
 
     def notify_update_refreshed(self) -> None:
         vinfo: Dict[str, Any] = {}
@@ -652,6 +667,92 @@ class CommandHelper:
 
         eventloop = self.server.get_event_loop()
         return await eventloop.run_in_thread(_createdir, suffix, prefix)
+
+class InstanceTracker:
+    def __init__(self, server: Server) -> None:
+        self.server = server
+        self.inst_id = b""
+        self.shm = self._try_open_shm()
+
+    def _try_open_shm(self) -> Any:
+        prev_mask = os.umask(0)
+        try:
+            from multiprocessing.shared_memory import SharedMemory
+            setattr(SharedMemory, "_mode", 438)
+            try:
+                return SharedMemory("moonraker_instance_ids", True, 4096)
+            except FileExistsError:
+                return SharedMemory("moonraker_instance_ids")
+        except Exception as e:
+            self.server.add_log_rollover_item(
+                "um_multi_instance_msg",
+                "Failed to open shared memory, update_manager instance tracking "
+                f"disabled.\n{e.__class__.__name__}: {e}"
+            )
+            return None
+        finally:
+            os.umask(prev_mask)
+
+    def get_instance_id(self) -> bytes:
+        machine: Machine = self.server.lookup_component("machine")
+        cur_name = "".join(machine.unit_name.split())
+        cur_uuid: str = self.server.get_app_args()["instance_uuid"]
+        pid = os.getpid()
+        return f"{cur_name}:{cur_uuid}:{pid}".encode(errors="ignore")
+
+    def _read_instance_ids(self) -> List[bytes]:
+        if self.shm is not None:
+            try:
+                data = bytearray(self.shm.buf)
+                idx = data.find(b"\x00")
+                if idx > 1:
+                    return bytes(data[:idx]).strip().splitlines()
+            except Exception:
+                logging.exception("Failed to Read Shared Memory")
+        return []
+
+    def set_instance_id(self) -> None:
+        if self.shm is None:
+            return
+        self.inst_id = self.get_instance_id()
+        iids = self._read_instance_ids()
+        if self.inst_id not in iids:
+            iids.append(self.inst_id)
+        if len(iids) > 1:
+            id_str = "\n".join([iid.decode(errors="ignore") for iid in iids])
+            self.server.add_log_rollover_item(
+                "um_multi_instance_msg",
+                "Multiple instances of Moonraker have the update manager enabled."
+                f"\n{id_str}"
+            )
+        encoded_ids = b"\n".join(iids) + b"\x00"
+        if len(encoded_ids) > self.shm.size:
+            iid = self.inst_id.decode(errors="ignore")
+            logging.info(f"Not enough storage in shared memory for id {iid}")
+            return
+        try:
+            buf: memoryview = self.shm.buf
+            buf[:len(encoded_ids)] = encoded_ids
+        except Exception:
+            logging.exception("Failed to Write Shared Memory")
+
+    def close(self) -> None:
+        if self.shm is None:
+            return
+        # Remove current id and clean up shared memory
+        iids = self._read_instance_ids()
+        if self.inst_id in iids:
+            iids.remove(self.inst_id)
+        try:
+            buf: memoryview = self.shm.buf
+            null_len = min(self.shm.size, max(len(self.inst_id), 10))
+            data = b"\n".join(iids) + b"\x00" if iids else b"\x00" * null_len
+            buf[:len(data)] = data
+            self.shm.close()
+            if not iids:
+                self.shm.unlink()
+        except Exception:
+            logging.exception("Failed to write/close shared memory")
 
 
 def load_component(config: ConfigHelper) -> UpdateManager:

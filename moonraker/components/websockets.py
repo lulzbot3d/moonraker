@@ -9,13 +9,13 @@ import logging
 import asyncio
 from tornado.websocket import WebSocketHandler, WebSocketClosedError
 from tornado.web import HTTPError
-from .common import (
+from ..common import (
     RequestType,
     WebRequest,
     BaseRemoteConnection,
     TransportType,
 )
-from .utils import ServerError, parse_ip_address
+from ..utils import ServerError, parse_ip_address
 
 # Annotation imports
 from typing import (
@@ -31,12 +31,13 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from .server import Server
+    from ..server import Server
     from .klippy_connection import KlippyConnection as Klippy
-    from .confighelper import ConfigHelper
-    from .components.extensions import ExtensionManager
-    from .components.authorization import Authorization
-    from .utils import IPAddress
+    from ..confighelper import ConfigHelper
+    from .application import MoonrakerApp
+    from .extensions import ExtensionManager
+    from .authorization import Authorization
+    from ..utils import IPAddress
     ConvType = Union[str, bool, float, int]
     ArgVal = Union[None, int, float, bool, str]
     RPCCallback = Callable[..., Coroutine]
@@ -50,6 +51,9 @@ class WebsocketManager:
         self.clients: Dict[int, BaseRemoteConnection] = {}
         self.bridge_connections: Dict[int, BridgeSocket] = {}
         self.closed_event: Optional[asyncio.Event] = None
+        app: MoonrakerApp = self.server.lookup_component("application")
+        app.register_websocket_handler("/websocket", WebSocket)
+        app.register_websocket_handler("/klippysocket", BridgeSocket)
         self.server.register_endpoint(
             "/server/websocket/id", RequestType.GET, self._handle_id_request,
             TransportType.WEBSOCKET
@@ -58,7 +62,6 @@ class WebsocketManager:
             "/server/connection/identify", RequestType.POST, self._handle_identify,
             TransportType.WEBSOCKET, auth_required=False
         )
-        self.server.register_component("websockets", self)
 
     def register_notification(
         self,
@@ -131,7 +134,10 @@ class WebsocketManager:
     def has_socket(self, ws_id: int) -> bool:
         return ws_id in self.clients
 
-    def get_client(self, ws_id: int) -> Optional[BaseRemoteConnection]:
+    def get_client(self, uid: int) -> Optional[BaseRemoteConnection]:
+        return self.clients.get(uid, None)
+
+    def get_client_ws(self, ws_id: int) -> Optional[WebSocket]:
         sc = self.clients.get(ws_id, None)
         if sc is None or not isinstance(sc, WebSocket):
             return None
@@ -232,6 +238,7 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
         self.on_create(self.settings['server'])
         self._ip_addr = parse_ip_address(self.request.remote_ip or "")
         self.last_pong_time: float = self.eventloop.get_loop_time()
+        self.cors_allowed: bool = False
 
     @property
     def ip_addr(self) -> Optional[IPAddress]:
@@ -302,10 +309,7 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
 
     def check_origin(self, origin: str) -> bool:
         if not super(WebSocket, self).check_origin(origin):
-            auth: AuthComp = self.server.lookup_component('authorization', None)
-            if auth is not None:
-                return auth.check_cors(origin)
-            return False
+            return self.cors_allowed
         return True
 
     def on_user_logout(self, user: str) -> bool:
@@ -315,7 +319,7 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
         return False
 
     # Check Authorized User
-    def prepare(self) -> None:
+    async def prepare(self) -> None:
         max_conns = self.settings["max_websocket_connections"]
         if self.__class__.connection_count >= max_conns:
             raise self.server.error(
@@ -324,11 +328,16 @@ class WebSocket(WebSocketHandler, BaseRemoteConnection):
         auth: AuthComp = self.server.lookup_component('authorization', None)
         if auth is not None:
             try:
-                self._user_info = auth.authenticate_request(self.request)
+                self._user_info = await auth.authenticate_request(self.request)
             except Exception as e:
                 logging.info(f"Websocket Failed Authentication: {e}")
                 self._user_info = None
                 self._need_auth = True
+            if "Origin" in self.request.headers:
+                origin = self.request.headers.get("Origin")
+            else:
+                origin = self.request.headers.get("Sec-Websocket-Origin", None)
+            self.cors_allowed = await auth.check_cors(origin)
 
     def close_socket(self, code: int, reason: str) -> None:
         self.close(code, reason)
@@ -345,6 +354,7 @@ class BridgeSocket(WebSocketHandler):
         self.klippy_writer: Optional[asyncio.StreamWriter] = None
         self.klippy_write_buf: List[bytes] = []
         self.klippy_queue_busy: bool = False
+        self.cors_allowed: bool = False
 
     @property
     def ip_addr(self) -> Optional[IPAddress]:
@@ -453,10 +463,7 @@ class BridgeSocket(WebSocketHandler):
 
     def check_origin(self, origin: str) -> bool:
         if not super().check_origin(origin):
-            auth: AuthComp = self.server.lookup_component('authorization', None)
-            if auth is not None:
-                return auth.check_cors(origin)
-            return False
+            return self.cors_allowed
         return True
 
     # Check Authorized User
@@ -468,7 +475,12 @@ class BridgeSocket(WebSocketHandler):
             )
         auth: AuthComp = self.server.lookup_component("authorization", None)
         if auth is not None:
-            self.current_user = auth.authenticate_request(self.request)
+            self.current_user = await auth.authenticate_request(self.request)
+            if "Origin" in self.request.headers:
+                origin = self.request.headers.get("Origin")
+            else:
+                origin = self.request.headers.get("Sec-Websocket-Origin", None)
+            self.cors_allowed = await auth.check_cors(origin)
         kconn: Klippy = self.server.lookup_component("klippy_connection")
         try:
             reader, writer = await kconn.open_klippy_connection()
@@ -481,3 +493,6 @@ class BridgeSocket(WebSocketHandler):
 
     def close_socket(self, code: int, reason: str) -> None:
         self.close(code, reason)
+
+def load_component(config: ConfigHelper) -> WebsocketManager:
+    return WebsocketManager(config)
