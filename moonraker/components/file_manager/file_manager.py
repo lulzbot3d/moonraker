@@ -15,6 +15,8 @@ import asyncio
 import zipfile
 import time
 import math
+import shlex
+import contextlib
 from copy import deepcopy
 from inotify_simple import INotify
 from inotify_simple import flags as iFlags
@@ -43,18 +45,15 @@ from typing import (
 if TYPE_CHECKING:
     from inotify_simple import Event as InotifyEvent
     from ...confighelper import ConfigHelper
-    from ...common import WebRequest
+    from ...common import WebRequest, UserInfo
     from ..klippy_connection import KlippyConnection
-    from .. import database
-    from .. import klippy_apis
-    from .. import shell_command
     from ..job_queue import JobQueue
     from ..job_state import JobState
     from ..secrets import Secrets
+    from ..klippy_apis import KlippyAPI as APIComp
+    from ..database import MoonrakerDatabase as DBComp
+    from ..shell_command import ShellCommandFactory as SCMDComp
     StrOrPath = Union[str, pathlib.Path]
-    DBComp = database.MoonrakerDatabase
-    APIComp = klippy_apis.KlippyAPI
-    SCMDComp = shell_command.ShellCommandFactory
     _T = TypeVar("_T")
 
 VALID_GCODE_EXTS = ['.gcode', '.g', '.gco', '.ufp', '.nc']
@@ -79,9 +78,8 @@ class FileManager:
         db_path = db.get_database_path()
         self.add_reserved_path("database", db_path, False)
         self.add_reserved_path("certs", self.datapath.joinpath("certs"), False)
-        self.add_reserved_path(
-            "systemd", self.datapath.joinpath("systemd"), False
-        )
+        self.add_reserved_path("systemd", self.datapath.joinpath("systemd"), False)
+        self.add_reserved_path("backup", self.datapath.joinpath("backup"), False)
         self.gcode_metadata = MetadataStorage(config, db)
         self.sync_lock = NotifySyncLock(config)
         avail_observers: Dict[str, Type[BaseFileSystemObserver]] = {
@@ -141,7 +139,7 @@ class FileManager:
             "/server/files/delete_file", RequestType.DELETE, self._handle_file_delete,
             transports=TransportType.WEBSOCKET
         )
-        # register client notificaitons
+        # register client notifications
         self.server.register_notification("file_manager:filelist_changed")
 
         self.server.register_event_handler(
@@ -178,7 +176,7 @@ class FileManager:
             if prune:
                 self.gcode_metadata.prune_storage()
 
-    async def component_init(self):
+    def start_file_observer(self):
         self.fs_observer.initialize()
 
     def _update_fixed_paths(self) -> None:
@@ -375,6 +373,12 @@ class FileManager:
         if root_dir is None or not full_path.startswith(root_dir):
             return ""
         return os.path.relpath(full_path, start=root_dir)
+
+    def get_full_path(self, root: str, relative_path: str) -> pathlib.Path:
+        root_dir = self.file_paths.get(root, None)
+        if root_dir is None:
+            raise self.server.error(f"Unknown root {root}")
+        return pathlib.Path(root_dir).joinpath(relative_path)
 
     def get_metadata_storage(self) -> MetadataStorage:
         return self.gcode_metadata
@@ -618,6 +622,8 @@ class FileManager:
                     ):
                         action = "modify_file"
                     op_func = shutil.copy2
+            else:
+                raise self.server.error(f"Invalid endpoint {ep}")
             self.sync_lock.setup(action, dest_path, move_copy=True)
             try:
                 full_dest = await self.event_loop.run_in_thread(
@@ -840,7 +846,7 @@ class FileManager:
                            ) -> Dict[str, Any]:
         if 'filename' not in upload_args:
             raise self.server.error(
-                "No file name specifed in upload form")
+                "No file name specified in upload form")
         # check relative path
         root: str = upload_args.get('root', "gcodes").lower()
         if root not in self.file_paths:
@@ -883,7 +889,8 @@ class FileManager:
             'start_print': start_print,
             'unzip_ufp': unzip_ufp,
             'ext': f_ext,
-            "is_link": os.path.islink(dest_path)
+            "is_link": os.path.islink(dest_path),
+            "user": upload_args.get("current_user")
         }
 
     async def _finish_gcode_upload(
@@ -904,10 +911,11 @@ class FileManager:
         started: bool = False
         queued: bool = False
         if upload_info['start_print']:
+            user: Optional[UserInfo] = upload_info.get("user")
             if can_start:
                 kapis: APIComp = self.server.lookup_component('klippy_apis')
                 try:
-                    await kapis.start_print(upload_info['filename'])
+                    await kapis.start_print(upload_info['filename'], user=user)
                 except self.server.error:
                     # Attempt to start print failed
                     pass
@@ -916,7 +924,7 @@ class FileManager:
             if self.queue_gcodes and not started:
                 job_queue: JobQueue = self.server.lookup_component('job_queue')
                 await job_queue.queue_job(
-                    upload_info['filename'], check_exists=False)
+                    upload_info['filename'], check_exists=False, user=user)
                 queued = True
         self.fs_observer.on_item_create("gcodes", upload_info["dest_path"])
         result = dict(self._sched_changed_event(
@@ -985,8 +993,8 @@ class FileManager:
         visited_dirs = {(st.st_dev, st.st_ino)}
         for dir_path, dir_names, files in os.walk(path, followlinks=True):
             scan_dirs: List[str] = []
-            # Filter out directories that have already been visted. This
-            # prevents infinite recrusion "followlinks" is set to True
+            # Filter out directories that have already been visited. This
+            # prevents infinite recursion "followlinks" is set to True
             for dname in dir_names:
                 full_path = os.path.join(dir_path, dname)
                 if not os.path.exists(full_path):
@@ -1173,7 +1181,7 @@ class NotifySyncLock(asyncio.Lock):
             current_path = pathlib.Path(current_path)
         self.dest_path = current_path
         if current_path in self.acquired_paths:
-            # Notifcation has been recieved, no need to wait
+            # Notification has been received, no need to wait
             return
         self.move_copy_fut = self.server.get_event_loop().create_future()
         mcfut = self.move_copy_fut
@@ -1181,6 +1189,7 @@ class NotifySyncLock(asyncio.Lock):
         timeout = 1200. if has_pending else 1.
         for _ in range(5):
             try:
+                assert mcfut is not None
                 await asyncio.wait_for(asyncio.shield(mcfut), timeout)
             except asyncio.TimeoutError:
                 if timeout > 2.:
@@ -1241,7 +1250,7 @@ class NotifySyncLock(asyncio.Lock):
         waiter: Optional[asyncio.Future] = None
         if self.check_pending:
             # The final path of move/copy requests aren't known until the request
-            # complete.  It may be the destination path recieved from the request
+            # complete.  It may be the destination path received from the request
             # or it may be a child as of that path.
             if self.move_copy_fut is not None:
                 # Request is complete, metadata analysis pending.  We can explicitly
@@ -1375,8 +1384,8 @@ class BaseFileSystemObserver:
         visited_dirs = {(st.st_dev, st.st_ino)}
         for parent, dirs, files in os.walk(start_path, followlinks=True):
             scan_dirs: List[str] = []
-            # Filter out directories that have already been visted. This
-            # prevents infinite recrusion "followlinks" is set to True
+            # Filter out directories that have already been visited. This
+            # prevents infinite recursion "followlinks" is set to True
             parent_dir = pathlib.Path(parent)
             for dname in dirs:
                 dir_path = parent_dir.joinpath(dname)
@@ -1507,7 +1516,7 @@ class InotifyNode:
     def _finish_delete_child(self) -> None:
         # Items deleted in a child (node or file) are batched.
         # Individual files get notifications if their parent
-        # node stil exists.  Otherwise notififications are
+        # node still exists.  Otherwise notififications are
         # bundled into the topmost deleted parent.
         if "delete_child" not in self.pending_node_events:
             self.pending_deleted_children.clear()
@@ -1592,6 +1601,14 @@ class InotifyNode:
         if pending_node is not None:
             pending_node.stop_event("create_node")
         self.pending_file_events[file_name] = evt_name
+
+    def clear_file_event(self, file_name: str) -> str | None:
+        evt = self.pending_file_events.pop(file_name, None)
+        if evt is not None:
+            pending_node = self.search_pending_event("create_node")
+            if pending_node is not None:
+                pending_node.reset_event("create_node", INOTIFY_BUNDLE_TIME)
+        return evt
 
     def complete_file_write(self, file_name: str) -> None:
         self.flush_delete()
@@ -1841,19 +1858,18 @@ class InotifyObserver(BaseFileSystemObserver):
         return None
 
     def add_root_watch(self, root: str, root_path: str) -> None:
-        # remove all exisiting watches on root
+        # remove all existing watches on root
         if root in self.watched_roots:
             old_root = self.watched_roots.pop(root)
             old_root.clear_watches()
             old_root.clear_events()
         try:
             root_node = InotifyRootNode(self, root, root_path)
-        except Exception:
-            logging.exception(f"Inotify: failed to create root node '{root}'")
+        except Exception as e:
             self.server.add_warning(
                 f"file_manager: Failed to create inotify root node {root}. "
                 "See moonraker.log for details.",
-                log=False
+                exc_info=e
             )
             return
         self.watched_roots[root] = root_node
@@ -1873,15 +1889,16 @@ class InotifyObserver(BaseFileSystemObserver):
                 self._notify_root_updated, mevts, root, root_path)
 
     def initialize(self) -> None:
+        if self.initialized:
+            return
         for root, node in self.watched_roots.items():
             try:
                 evts = node.scan_node()
-            except Exception:
-                logging.exception(f"Inotify: failed to scan root '{root}'")
+            except Exception as e:
                 self.server.add_warning(
                     f"file_manager: Failed to scan inotify root node '{root}'. "
                     "See moonraker.log for details.",
-                    log=False
+                    exc_info=e
                 )
                 continue
             if not evts:
@@ -1961,7 +1978,7 @@ class InotifyObserver(BaseFileSystemObserver):
     def _handle_move_timeout(self, cookie: int, is_dir: bool):
         if cookie not in self.pending_moves:
             return
-        parent_node, name, hdl = self.pending_moves.pop(cookie)
+        parent_node, name, _ = self.pending_moves.pop(cookie)
         item_path = os.path.join(parent_node.get_path(), name)
         root = parent_node.get_root()
         self.clear_metadata(root, item_path, is_dir)
@@ -1975,6 +1992,8 @@ class InotifyObserver(BaseFileSystemObserver):
             child_node.clear_events(include_children=True)
             self.log_nodes()
             action = "delete_dir"
+        else:
+            parent_node.clear_file_event(name)
         self.notify_filelist_changed(action, root, item_path)
 
     def _schedule_pending_move(
@@ -2098,6 +2117,16 @@ class InotifyObserver(BaseFileSystemObserver):
                 hdl.cancel()
                 prev_root = prev_parent.get_root()
                 prev_path = os.path.join(prev_parent.get_path(), prev_name)
+                prev_evt = prev_parent.clear_file_event(prev_name)
+                if prev_evt is not None:
+                    # Handle case where file is opened, moved, then closed
+                    node.schedule_file_event(evt.name, prev_evt)
+                    if prev_evt == "create_file":
+                        # Swallow the move event for newly created files.  A
+                        # "create_file" notification will be sent when the file
+                        # is closed.
+                        self.clear_metadata(prev_root, prev_path)
+                        return
                 move_res = self.try_move_metadata(prev_root, root, prev_path, file_path)
                 if root == "gcodes":
                     coro = self._finish_gcode_move(
@@ -2279,6 +2308,8 @@ class MetadataStorage:
         self.server = config.get_server()
         self.enable_object_proc = config.getboolean(
             'enable_object_processing', False)
+        self.default_metadata_parser_timeout = config.getfloat(
+            'default_metadata_parser_timeout', 20.)
         self.gc_path = ""
         db.register_local_namespace(METADATA_NAMESPACE)
         self.mddb = db.wrap_namespace(
@@ -2300,6 +2331,7 @@ class MetadataStorage:
         self.pending_requests: Dict[
             str, Tuple[Dict[str, Any], asyncio.Event]] = {}
         self.busy: bool = False
+        self.processors: Dict[str, Dict[str, Any]] = {}
 
     def prune_storage(self) -> None:
         # Check for removed gcode files while moonraker was shutdown
@@ -2352,6 +2384,23 @@ class MetadataStorage:
 
     def is_file_processing(self, fname: str) -> bool:
         return fname in self.pending_requests
+
+    def register_gcode_processor(
+        self, name: str, config: Dict[str, Any] | None
+    ) -> None:
+        if config is None:
+            self.processors.pop(name, None)
+            return
+        elif name in self.processors:
+            raise self.server.error(f"File processor {name} already registered")
+        required_fields = ("name", "command", "timeout")
+        for req_field in required_fields:
+            if req_field not in config:
+                raise self.server.error(
+                    f"File processor configuration requires a `{req_field}` field"
+                )
+        self.processors[name] = config
+        logging.info(f"GCode Processor {name} registered")
 
     def _has_valid_data(self,
                         fname: str,
@@ -2519,6 +2568,9 @@ class MetadataStorage:
                     logging.exception("Error running extract_metadata.py")
                     retries -= 1
                 else:
+                    await self.server.send_event(
+                        "file_manager:metadata_processed", fname
+                    )
                     break
             else:
                 if ufp_path is None:
@@ -2530,7 +2582,7 @@ class MetadataStorage:
                     }
                     self.mddb[fname] = self.metadata[fname]
                 logging.info(
-                    f"Unable to extract medatadata from file: {fname}")
+                    f"Unable to extract metadata from file: {fname}")
             self.pending_requests.pop(fname, None)
             mevt.set()
         self.busy = False
@@ -2541,22 +2593,37 @@ class MetadataStorage:
                                     ) -> None:
         # Escape single quotes in the file name so that it may be
         # properly loaded
-        filename = filename.replace("\"", "\\\"")
-        cmd = " ".join([sys.executable, METADATA_SCRIPT, "-p",
-                        self.gc_path, "-f", f"\"{filename}\""])
-        timeout = 10.
-        if ufp_path is not None and os.path.isfile(ufp_path):
-            timeout = 300.
-            ufp_path.replace("\"", "\\\"")
-            cmd += f" -u \"{ufp_path}\""
-        if self.enable_object_proc:
-            timeout = 300.
-            cmd += " --check-objects"
+        config: Dict[str, Any] = {
+            "filename": filename,
+            "gcode_dir": self.gc_path,
+            "check_objects": self.enable_object_proc,
+            "ufp_path": ufp_path,
+            "processors": list(self.processors.values())
+        }
+        timeout = self.default_metadata_parser_timeout
+        if ufp_path is not None or self.enable_object_proc:
+            timeout = max(timeout, 300.)
+        if self.processors:
+            proc_timeout = sum(
+                [proc.get("timeout", 0) for proc in self.processors.values()]
+            )
+            timeout = max(timeout, proc_timeout)
+        eventloop = self.server.get_event_loop()
+        md_cfg = await eventloop.run_in_thread(self._create_metadata_cfg, config)
+        cmd = " ".join([sys.executable, METADATA_SCRIPT, "-c", shlex.quote(md_cfg)])
         result = bytearray()
-        sc: SCMDComp = self.server.lookup_component('shell_command')
-        scmd = sc.build_shell_command(cmd, callback=result.extend, log_stderr=True)
-        if not await scmd.run(timeout=timeout):
-            raise self.server.error("Extract Metadata returned with error")
+        try:
+            sc: SCMDComp = self.server.lookup_component('shell_command')
+            scmd = sc.build_shell_command(
+                cmd, callback=result.extend, log_stderr=True
+            )
+            if not await scmd.run(timeout=timeout):
+                raise self.server.error("Extract Metadata returned with error")
+        finally:
+            def _rm_md_config():
+                with contextlib.suppress(OSError):
+                    os.remove(md_cfg)
+            await eventloop.run_in_thread(_rm_md_config)
         try:
             decoded_resp: Dict[str, Any] = jsonw.loads(result.strip())
         except Exception:
@@ -2570,6 +2637,13 @@ class MetadataStorage:
         metadata.update({'print_start_time': None, 'job_id': None})
         self.metadata[path] = metadata
         self.mddb[path] = metadata
+
+    def _create_metadata_cfg(self, config: Dict[str, Any]) -> str:
+        with tempfile.NamedTemporaryFile(
+            prefix="metacfg-", suffix=".json", delete=False
+        ) as f:
+            f.write(jsonw.dumps(config))
+            return f.name
 
 def load_component(config: ConfigHelper) -> FileManager:
     return FileManager(config)

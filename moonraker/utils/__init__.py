@@ -21,6 +21,7 @@ import socket
 import enum
 import ipaddress
 import platform
+from .exceptions import ServerError
 from . import source_info
 from . import json_wrapper
 
@@ -48,11 +49,6 @@ try:
     KERNEL_VERSION = tuple([int(part) for part in platform.release().split(".")[:2]])
 except Exception:
     KERNEL_VERSION = (0, 0)
-
-class ServerError(Exception):
-    def __init__(self, message: str, status_code: int = 400) -> None:
-        Exception.__init__(self, message)
-        self.status_code = status_code
 
 
 class Sentinel(enum.Enum):
@@ -140,7 +136,7 @@ def get_repo_info(source_path: str) -> Dict[str, Any]:
                 comp = parts[1].split("/", maxsplit=1)[-1]
                 repo_info["unofficial_components"].append(comp)
     except Exception:
-        logging.exception("Error Retreiving Git Repo Info")
+        logging.exception("Error Retrieving Git Repo Info")
     return repo_info
 
 def get_software_info() -> Dict[str, Any]:

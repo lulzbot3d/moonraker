@@ -30,8 +30,8 @@ if TYPE_CHECKING:
     from ..http_client import HttpClient
 
 class GitDeploy(AppDeploy):
-    def __init__(self, config: ConfigHelper, cmd_helper: CommandHelper) -> None:
-        super().__init__(config, cmd_helper, "Git Repo")
+    def __init__(self, config: ConfigHelper) -> None:
+        super().__init__(config, "Git Repo")
         self._configure_path(config)
         self._configure_virtualenv(config)
         self._configure_dependencies(config)
@@ -39,15 +39,24 @@ class GitDeploy(AppDeploy):
         self.origin: str = config.get('origin')
         self.moved_origin: Optional[str] = config.get('moved_origin', None)
         self.primary_branch = config.get("primary_branch", "master")
+        pinned_commit = config.get("pinned_commit", None)
+        if pinned_commit is not None:
+            pinned_commit = pinned_commit.lower()
+            # validate the hash length
+            if len(pinned_commit) < 8:
+                raise config.error(
+                    f"[{config.get_name()}]: Value for option 'commit' must be "
+                    "a minimum of 8 characters."
+                )
         self.repo = GitRepo(
-            cmd_helper, self.path, self.name, self.origin,
-            self.moved_origin, self.primary_branch, self.channel
+            self.cmd_helper, self.path, self.name, self.origin, self.moved_origin,
+            self.primary_branch, self.channel, pinned_commit
         )
 
     async def initialize(self) -> Dict[str, Any]:
         storage = await super().initialize()
         await self.repo.restore_state(storage)
-        self._is_valid = storage.get("is_valid", self.repo.is_valid())
+        self._is_valid = self.repo.is_valid()
         if not self.needs_refresh():
             self.repo.log_repo_info()
         return storage
@@ -75,7 +84,7 @@ class GitDeploy(AppDeploy):
             self._save_state()
 
     async def update(self) -> bool:
-        await self.repo.wait_for_init()
+        await self.repo.wait_for_refresh()
         if not self._is_valid:
             raise self.log_exc("Update aborted, repo not valid", False)
         if self.repo.is_dirty():
@@ -142,7 +151,8 @@ class GitDeploy(AppDeploy):
 
     def get_update_status(self) -> Dict[str, Any]:
         status = super().get_update_status()
-        status.update(self.repo.get_repo_status())
+        status.update(self.repo.get_repo_status(self.report_anomalies))
+        status["name"] = self.name
         return status
 
     def get_persistent_data(self) -> Dict[str, Any]:
@@ -201,7 +211,8 @@ class GitRepo:
         origin_url: str,
         moved_origin_url: Optional[str],
         primary_branch: str,
-        channel: Channel
+        channel: Channel,
+        pinned_commit: Optional[str]
     ) -> None:
         self.server = cmd_helper.get_server()
         self.cmd_helper = cmd_helper
@@ -228,12 +239,12 @@ class GitRepo:
 
         self.repo_warnings: List[str] = []
         self.repo_anomalies: List[str] = []
-        self.init_evt: Optional[asyncio.Event] = None
-        self.initialized: bool = False
+        self.refresh_lock: asyncio.Lock = asyncio.Lock()
         self.git_operation_lock = asyncio.Lock()
         self.fetch_timeout_handle: Optional[asyncio.Handle] = None
         self.fetch_input_recd: bool = False
         self.channel = channel
+        self.pinned_commit = pinned_commit
         self.is_shallow = False
 
     async def restore_state(self, storage: Dict[str, Any]) -> None:
@@ -268,6 +279,7 @@ class GitRepo:
         self.rollback_branch: str = storage.get('rollback_branch', def_rbs["branch"])
         rbv = storage.get('rollback_version', self.current_version)
         self.rollback_version = GitVersion(str(rbv))
+        self.pinned_commit_valid: bool = storage.get('pinned_commit_valid', True)
         if not await self._detect_git_dir():
             self.valid_git_repo = False
         self._check_warnings()
@@ -296,92 +308,95 @@ class GitRepo:
             'diverged': self.diverged,
             'corrupt': self.repo_corrupt,
             'modified_files': self.modified_files,
-            'untracked_files': self.untracked_files
+            'untracked_files': self.untracked_files,
+            'pinned_commit_valid': self.pinned_commit_valid
         }
 
     async def refresh_repo_state(self, need_fetch: bool = True) -> None:
-        if self.init_evt is not None:
-            # No need to initialize multiple requests
-            await self.init_evt.wait()
-            if self.initialized:
+        refresh_in_progress = self.refresh_lock.locked()
+        async with self.refresh_lock:
+            if refresh_in_progress:
+                # Avoid repetitive refresh calls
                 return
-        self.initialized = False
-        self.init_evt = asyncio.Event()
-        self.git_messages.clear()
-        try:
-            await self._check_repo_status()
-            self._verify_repo()
-            await self._find_current_branch()
+            self.pinned_commit_valid = True
+            self.current_commit = self.upstream_commit = "?"
+            self.current_version = self.upstream_version = GitVersion("?")
+            self.git_messages.clear()
+            try:
+                await self._check_repo_status()
+                self._verify_repo()
+                await self._find_current_branch()
 
-            # Fetch the upstream url.  If the repo has been moved,
-            # set the new url
-            self.upstream_url = await self.remote(f"get-url {self.git_remote}", True)
-            if await self._check_moved_origin():
-                need_fetch = True
-            if self.git_remote == "origin":
-                self.recovery_url = self.upstream_url
-            else:
-                remote_list = (await self.remote()).splitlines()
-                logging.debug(
-                    f"Git Repo {self.alias}: Detected Remotes - {remote_list}"
+                # Fetch the upstream url.  If the repo has been moved set the new url
+                self.upstream_url = await self.remote(
+                    f"get-url {self.git_remote}", True
                 )
-                if "origin" in remote_list:
-                    self.recovery_url = await self.remote("get-url origin")
+                if await self._check_moved_origin():
+                    need_fetch = True
+                if self.git_remote == "origin":
+                    self.recovery_url = self.upstream_url
                 else:
-                    logging.info(
-                        f"Git Repo {self.alias}: Unable to detect recovery URL, "
-                        "Hard Recovery not available"
+                    remote_list = (await self.remote()).splitlines()
+                    logging.debug(
+                        f"Git Repo {self.alias}: Detected Remotes - {remote_list}"
                     )
-                    self.recovery_url = "?"
-            if need_fetch:
-                await self.fetch()
-            self.diverged = await self.check_diverged()
+                    if "origin" in remote_list:
+                        self.recovery_url = await self.remote("get-url origin")
+                    else:
+                        logging.info(
+                            f"Git Repo {self.alias}: Unable to detect recovery URL, "
+                            "Hard Recovery not available"
+                        )
+                        self.recovery_url = "?"
+                if need_fetch:
+                    await self.fetch()
+                self.diverged = await self.check_diverged()
 
-            # Parse GitHub Owner from URL
-            owner_match = re.match(r"https?://[^/]+/([^/]+)", self.upstream_url)
-            self.git_owner = "?"
-            if owner_match is not None:
-                self.git_owner = owner_match.group(1)
+                # Parse GitHub Owner from URL
+                owner_match = re.match(r"https?://[^/]+/([^/]+)", self.upstream_url)
+                self.git_owner = "?"
+                if owner_match is not None:
+                    self.git_owner = owner_match.group(1)
 
-            # Parse GitHub Repository Name from URL
-            repo_match = re.match(r".*\/([^\.]*).*", self.upstream_url)
-            self.git_repo_name = "?"
-            if repo_match is not None:
-                self.git_repo_name = repo_match.group(1)
-            self.current_commit = await self.rev_parse("HEAD")
-            git_desc = await self.describe("--always --tags --long --dirty --abbrev=8")
-            cur_ver = GitVersion(git_desc.strip())
-            upstream_ver = await self._get_upstream_version()
-            await self._set_versions(cur_ver, upstream_ver)
+                # Parse GitHub Repository Name from URL
+                repo_match = re.match(r".*\/([^\.]*).*", self.upstream_url)
+                self.git_repo_name = "?"
+                if repo_match is not None:
+                    self.git_repo_name = repo_match.group(1)
+                self.current_commit = await self.rev_parse("HEAD")
+                git_desc = await self.describe(
+                    "--always --tags --long --dirty --abbrev=8"
+                )
+                cur_ver = GitVersion(git_desc.strip())
+                upstream_ver = await self._get_upstream_version()
+                await self._set_versions(cur_ver, upstream_ver)
 
-            # Get Commits Behind
-            self.commits_behind = []
-            if self.commits_behind_count > 0:
-                cbh = await self.get_commits_behind()
-                tagged_commits = await self.get_tagged_commits()
-                debug_msg = '\n'.join([f"{k}: {v}" for k, v in tagged_commits.items()])
-                logging.debug(f"Git Repo {self.alias}: Tagged Commits\n{debug_msg}")
-                for i, commit in enumerate(cbh):
-                    tag = tagged_commits.get(commit['sha'], None)
-                    if i < 30 or tag is not None:
-                        commit['tag'] = tag
-                        self.commits_behind.append(commit)
-            self._check_warnings()
-        except Exception:
-            logging.exception(f"Git Repo {self.alias}: Initialization failure")
-            self._check_warnings()
-            raise
-        else:
-            self.initialized = True
-            # If no exception was raised assume the repo is not corrupt
-            self.repo_corrupt = False
-            if self.rollback_commit == "?" or self.rollback_branch == "?":
-                # Reset Rollback State
-                self.set_rollback_state(None)
-            self.log_repo_info()
-        finally:
-            self.init_evt.set()
-            self.init_evt = None
+                # Get Commits Behind
+                self.commits_behind = []
+                if self.commits_behind_count > 0:
+                    cbh = await self.get_commits_behind()
+                    tagged_commits = await self.get_tagged_commits()
+                    debug_msg = '\n'.join(
+                        [f"{k}: {v}" for k, v in tagged_commits.items()]
+                    )
+                    logging.debug(f"Git Repo {self.alias}: Tagged Commits\n{debug_msg}")
+                    for i, commit in enumerate(cbh):
+                        tag = tagged_commits.get(commit['sha'], None)
+                        if i < 30 or tag is not None:
+                            commit['tag'] = tag
+                            self.commits_behind.append(commit)
+                self._check_warnings()
+            except Exception:
+                logging.exception(f"Git Repo {self.alias}: Initialization failure")
+                self._check_warnings()
+                raise
+            else:
+                # If no exception was raised assume the repo is not corrupt
+                self.repo_corrupt = False
+                if self.rollback_commit == "?" or self.rollback_branch == "?":
+                    # Reset Rollback State
+                    self.set_rollback_state(None)
+                self.log_repo_info()
 
     async def _check_repo_status(self) -> bool:
         async with self.git_operation_lock:
@@ -393,11 +408,14 @@ class GitRepo:
                 return False
             await self._wait_for_lock_release()
             attempts = 3
+            resp: Optional[str] = None
             while attempts:
                 self.git_messages.clear()
                 try:
                     cmd = "status --porcelain -b"
-                    resp: Optional[str] = await self._run_git_cmd(cmd, attempts=1)
+                    resp = await self._run_git_cmd(
+                        cmd, attempts=1, corrupt_hdr="fatal:"
+                    )
                 except Exception:
                     attempts -= 1
                     resp = None
@@ -436,9 +454,16 @@ class GitRepo:
             eventloop = self.server.get_event_loop()
             data = await eventloop.run_in_thread(self.git_folder_path.read_text)
             ident, _, gitdir = data.partition(":")
-            if ident.strip() != "gitdir" or not gitdir.strip():
+            gitdir = gitdir.strip()
+            if ident.strip() != "gitdir" or not gitdir:
+                logging.warning(f"not a .git file: '{ident}' '{gitdir}' in '{data}'")
                 return False
-            self.git_folder_path = pathlib.Path(gitdir).expanduser().resolve()
+            gitdir_path = pathlib.Path(gitdir).expanduser()
+            resolved_path = (self.git_folder_path.parent / gitdir_path).resolve()
+            logging.info(
+                f"detecting git folder path '{self.git_folder_path}'"
+                f" leads to '{gitdir}' resolves to '{resolved_path}'")
+            self.git_folder_path = resolved_path
         if self.git_folder_path.is_dir():
             self.is_shallow = self.git_folder_path.joinpath("shallow").is_file()
             return True
@@ -447,7 +472,7 @@ class GitRepo:
     async def _find_current_branch(self) -> None:
         # Populate list of current branches
         blist = await self.list_branches()
-        current_branch = ""
+        current_branch = "?"
         self.branches = []
         for branch in blist:
             branch = branch.strip()
@@ -459,9 +484,18 @@ class GitRepo:
             if branch[0] == "(":
                 continue
             self.branches.append(branch)
-        if current_branch.startswith("(HEAD detached"):
+        if current_branch.startswith("("):
+            # A detached HEAD is rendered by git as either
+            # "(HEAD detached at <ref>)" or "(no branch)" (rebase in progress,
+            # some tag checkouts, older git).  Neither is a real branch, so the
+            # branch.<name>.remote tracking lookup must be skipped -- it would
+            # build the invalid key "branch.(no branch).remote".  A remote and
+            # branch are recovered only when git spells them out in the ref;
+            # otherwise the previously tracked values (if any) are kept.
             self.head_detached = True
-            ref_name = current_branch.split()[-1][:-1]
+            ref_name = ""
+            if current_branch.startswith("(HEAD detached"):
+                ref_name = current_branch.split()[-1][:-1]
             remote_list = (await self.remote()).splitlines()
             for remote in remote_list:
                 remote = remote.strip()
@@ -536,7 +570,17 @@ class GitRepo:
 
     async def _get_upstream_version(self) -> GitVersion:
         self.commits_behind_count = 0
-        if self.channel == Channel.DEV:
+        if self.pinned_commit is not None:
+            self.upstream_commit = self.current_commit
+            if not self.current_commit.lower().startswith(self.pinned_commit):
+                if not await self.check_commit_exists(self.pinned_commit):
+                    self.pinned_commit_valid = False
+                elif await self.is_ancestor(self.current_commit, self.pinned_commit):
+                    self.upstream_commit = self.pinned_commit
+            upstream_ver_str = await self.describe(
+                f"{self.upstream_commit} --always --tags --long --abbrev=8",
+            )
+        elif self.channel == Channel.DEV:
             self.upstream_commit = await self.rev_parse(
                 f"{self.git_remote}/{self.git_branch}"
             )
@@ -605,20 +649,20 @@ class GitRepo:
         self.current_version = current_version
         self.upstream_version = upstream_version
 
-    async def wait_for_init(self) -> None:
-        if self.init_evt is not None:
-            await self.init_evt.wait()
-            if not self.initialized:
-                raise self.server.error(
-                    f"Git Repo {self.alias}: Initialization failure")
+    async def wait_for_refresh(self) -> None:
+        if self.refresh_lock.locked():
+            async with self.refresh_lock:
+                return
 
-    async def is_ancestor(self, ancestor_ref: str, descendent_ref: str) -> bool:
+    async def is_ancestor(
+        self, ancestor_ref: str, descendent_ref: str, attempts: int = 3
+    ) -> bool:
         self._verify_repo()
         cmd = f"merge-base --is-ancestor {ancestor_ref} {descendent_ref}"
         async with self.git_operation_lock:
-            for _ in range(3):
+            for _ in range(attempts):
                 try:
-                    await self._run_git_cmd(cmd, attempts=1, corrupt_msg="error: ")
+                    await self._run_git_cmd(cmd, attempts=1, corrupt_hdr="error: ")
                 except self.cmd_helper.get_shell_command().error as err:
                     if err.return_code == 1:
                         return False
@@ -660,13 +704,20 @@ class GitRepo:
             f"Is Detached: {self.head_detached}\n"
             f"Is Shallow: {self.is_shallow}\n"
             f"Commits Behind Count: {self.commits_behind_count}\n"
-            f"Diverged: {self.diverged}"
+            f"Diverged: {self.diverged}\n"
+            f"Pinned Commit: {self.pinned_commit}"
             f"{warnings}"
         )
 
     def _check_warnings(self) -> None:
         self.repo_warnings.clear()
         self.repo_anomalies.clear()
+        if self.pinned_commit is not None and not self.pinned_commit_valid:
+            self.repo_anomalies.append(
+                f"Pinned Commit {self.pinned_commit} does not exist"
+            )
+        if not self.valid_git_repo:
+            self.repo_warnings.append("No git repo detected at configured path")
         if self.repo_corrupt:
             self.repo_warnings.append("Repo is corrupt")
         if self.git_branch == "?":
@@ -675,19 +726,21 @@ class GitRepo:
             self.repo_warnings.append(
                 f"Failed to detect tracking remote for branch {self.git_branch}"
             )
+        elif self.git_branch != self.primary_branch or self.git_remote != "origin":
+            self.repo_anomalies.append(
+                "Repo not on official remote/branch, expected: "
+                f"origin/{self.primary_branch}, detected: "
+                f"{self.git_remote}/{self.git_branch}")
         if self.upstream_url == "?":
             self.repo_warnings.append("Failed to detect repo url")
-            return
-        upstream_url = self.upstream_url.lower()
-        if upstream_url[-4:] != ".git":
-            upstream_url += ".git"
-        #if upstream_url != self.origin_url.lower():
-        #    self.repo_anomalies.append(f"Unofficial remote url: {self.upstream_url}")
-        #if self.git_branch != self.primary_branch or self.git_remote != "origin":
-        #    self.repo_anomalies.append(
-        #        "Repo not on offical remote/branch, expected: "
-        #        f"origin/{self.primary_branch}, detected: "
-        #        f"{self.git_remote}/{self.git_branch}")
+        else:
+            upstream_url = self.upstream_url.lower()
+            if upstream_url[-4:] != ".git":
+                upstream_url += ".git"
+            if upstream_url != self.origin_url.lower():
+                self.repo_anomalies.append(
+                    f"Unofficial remote url: {self.upstream_url}"
+                )
         if self.untracked_files:
             self.repo_anomalies.append(
                 f"Repo has untracked source files: {self.untracked_files}"
@@ -702,7 +755,7 @@ class GitRepo:
                 self.repo_warnings.append(msg)
         if self.is_dirty():
             self.repo_warnings.append(
-                "Repo is dirty.  Detected the following modifed files: "
+                "Repo is dirty.  Detected the following modified files: "
                 f"{self.modified_files}"
             )
         self._generate_warn_msg()
@@ -731,7 +784,7 @@ class GitRepo:
     async def reset(self, ref: Optional[str] = None) -> None:
         async with self.git_operation_lock:
             if ref is None:
-                if self.channel != Channel.DEV:
+                if self.channel != Channel.DEV or self.pinned_commit is not None:
                     ref = self.upstream_commit
                 else:
                     if self.git_remote == "?" or self.git_branch == "?":
@@ -760,7 +813,7 @@ class GitRepo:
         cmd = "pull --progress"
         if self.server.is_debug_enabled():
             cmd = f"{cmd} --rebase"
-        if self.channel != Channel.DEV:
+        if self.channel != Channel.DEV or self.pinned_commit is not None:
             cmd = f"{cmd} {self.git_remote} {self.upstream_commit}"
         async with self.git_operation_lock:
             await self._run_git_cmd_async(cmd)
@@ -770,6 +823,18 @@ class GitRepo:
         async with self.git_operation_lock:
             resp = await self._run_git_cmd("branch --list --no-color")
             return resp.strip().split("\n")
+
+    async def check_commit_exists(self, commit: str) -> bool:
+        self._verify_repo()
+        async with self.git_operation_lock:
+            shell_cmd = self.cmd_helper.get_shell_command()
+            try:
+                await self._run_git_cmd(
+                    f"cat-file -e {commit}^{{commit}}", attempts=1
+                )
+            except shell_cmd.error:
+                return False
+            return True
 
     async def remote(self, command: str = "", validate: bool = False) -> str:
         self._verify_repo(check_remote=validate)
@@ -846,8 +911,8 @@ class GitRepo:
         reset_commit: Optional[str] = None
         async with self.git_operation_lock:
             if branch is None:
-                # No branch is specifed so we are checking out detached
-                if self.channel != Channel.DEV:
+                # No branch is specified so we are checking out detached
+                if self.channel != Channel.DEV or self.pinned_commit is not None:
                     reset_commit = self.upstream_commit
                 branch = f"{self.git_remote}/{self.git_branch}"
             await self._run_git_cmd(f"checkout -q {branch}")
@@ -893,17 +958,13 @@ class GitRepo:
             self.valid_git_repo = True
             self.cmd_helper.notify_update_response(
                 f"Git Repo {self.alias}: Git Clone Complete")
-        if self.current_commit != "?":
-            try:
-                can_reset = await self.is_ancestor(self.current_commit, "HEAD")
-            except self.server.error:
-                can_reset = False
-            if can_reset:
-                self.cmd_helper.notify_update_response(
-                    f"Git Repo {self.alias}: Moving HEAD to previous "
-                    f"commit {self.current_commit}"
-                )
-                await self.reset(self.current_commit)
+        reset_commit = await self.get_recovery_ref("HEAD")
+        if reset_commit != "HEAD":
+            self.cmd_helper.notify_update_response(
+                f"Git Repo {self.alias}: Moving HEAD to previous "
+                f"commit {self.current_commit}"
+            )
+            await self.reset(reset_commit)
 
     async def rollback(self) -> bool:
         if self.rollback_commit == "?" or self.rollback_branch == "?":
@@ -938,7 +999,7 @@ class GitRepo:
         if self.is_current():
             return []
         async with self.git_operation_lock:
-            if self.channel != Channel.DEV:
+            if self.channel != Channel.DEV or self.pinned_commit is not None:
                 ref = self.upstream_commit
             else:
                 ref = f"{self.git_remote}/{self.git_branch}"
@@ -976,10 +1037,12 @@ class GitRepo:
             # Return tagged commits as SHA keys mapped to tag values
             return tagged_commits
 
-    def get_repo_status(self) -> Dict[str, Any]:
+    def get_repo_status(self, rpt_anomalies: bool) -> Dict[str, Any]:
         no_untrk_src = len(self.untracked_files) == 0
+        anomalies = self.repo_anomalies if rpt_anomalies else []
         return {
             'detected_type': "git_repo",
+            'repo_detected': self.valid_git_repo,
             'remote_alias': self.git_remote,
             'branch': self.git_branch,
             'owner': self.git_owner,
@@ -1000,7 +1063,7 @@ class GitRepo:
             'pristine': no_untrk_src and not self.current_version.dirty,
             'corrupt': self.repo_corrupt,
             'warnings': self.repo_warnings,
-            'anomalies': self.repo_anomalies
+            'anomalies': anomalies
         }
 
     def get_version(self, upstream: bool = False) -> GitVersion:
@@ -1023,6 +1086,7 @@ class GitRepo:
 
     def is_valid(self) -> bool:
         return (
+            "?" not in (self.git_branch, self.git_remote, self.upstream_commit) and
             not self.is_damaged() and
             not self.has_recoverable_errors()
         )
@@ -1048,7 +1112,7 @@ class GitRepo:
             return "worktree"
         return "repo"
 
-    async def get_recovery_ref(self) -> str:
+    async def get_recovery_ref(self, upstream_ref: Optional[str] = None) -> str:
         """ Fetch the best reference for a 'reset' recovery attempt
 
         Returns the ref to reset to for "soft" recovery requests.  The
@@ -1056,17 +1120,25 @@ class GitRepo:
         only possible if the commit is known and if it is an ancestor of
         the primary branch.
         """
-        remote = await self.config_get(f"branch.{self.primary_branch}.remote")
-        if remote is None:
-            raise self.server.error(
-                f"Failed to find remote for primary branch '{self.primary_branch}'"
-            )
-        upstream_ref = f"{remote}/{self.primary_branch}"
-        if (
-            self.current_commit != "?" and
-            await self.is_ancestor(self.current_commit, upstream_ref)
-        ):
-            return self.current_commit
+        if upstream_ref is None:
+            remote = await self.config_get(f"branch.{self.primary_branch}.remote")
+            if remote is None:
+                raise self.server.error(
+                    f"Failed to find remote for primary branch '{self.primary_branch}'"
+                )
+            upstream_ref = f"{remote}/{self.primary_branch}"
+        reset_commits: List[str] = []
+        if self.pinned_commit is not None:
+            reset_commits.append(self.pinned_commit)
+        if self.current_commit != "?":
+            reset_commits.append(self.current_commit)
+        for commit in reset_commits:
+            try:
+                is_ancs = await self.is_ancestor(commit, upstream_ref, attempts=1)
+            except self.server.error:
+                is_ancs = False
+            if is_ancs:
+                return commit
         return upstream_ref
 
     async def _check_lock_file_exists(self, remove: bool = False) -> bool:
@@ -1154,7 +1226,8 @@ class GitRepo:
                 await scmd.run(timeout=0)
             except Exception:
                 pass
-            self.fetch_timeout_handle.cancel()
+            if self.fetch_timeout_handle is not None:
+                self.fetch_timeout_handle.cancel()
             ret = scmd.get_return_code()
             if ret == 0:
                 self.git_messages.clear()
@@ -1166,7 +1239,7 @@ class GitRepo:
                     fix_loose = False
                     attempts = 2
                 else:
-                    # since the attept to repair failed, bypass attempts
+                    # since the attempt to repair failed, bypass attempts
                     # and immediately raise an exception
                     raise self.server.error(
                         "Unable to repair loose objects, use hard recovery"
@@ -1180,7 +1253,7 @@ class GitRepo:
         self.fetch_input_recd = True
         out = output.decode().strip()
         if out:
-            if out.startswith("fatal: "):
+            if out.startswith("fatal: ") and "corrupt" in out:
                 self.repo_corrupt = True
             self.git_messages.append(out)
             self.cmd_helper.notify_update_response(out)
@@ -1215,7 +1288,7 @@ class GitRepo:
         timeout: float = 20.,
         attempts: int = 5,
         env: Optional[Dict[str, str]] = None,
-        corrupt_msg: str = "fatal: ",
+        corrupt_hdr: Optional[str] = None,
         log_complete: bool = True
     ) -> str:
         shell_cmd = self.cmd_helper.get_shell_command()
@@ -1238,9 +1311,10 @@ class GitRepo:
             if stderr:
                 msg_lines.extend(stdout.split("\n"))
                 self.git_messages.append(stderr)
-            for line in msg_lines:
-                line = line.strip().lower()
-                if line.startswith(corrupt_msg):
-                    self.repo_corrupt = True
-                    break
+            if corrupt_hdr is not None:
+                for line in msg_lines:
+                    line = line.strip().lower()
+                    if line.startswith(corrupt_hdr) and "corrupt" in line:
+                        self.repo_corrupt = True
+                        break
             raise
